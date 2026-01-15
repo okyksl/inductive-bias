@@ -147,6 +147,110 @@ def generate_dirichlet_markov_data(batch_size, seq_len, vocab_size, order, alpha
         
     return torch.stack(data), torch.stack(targets)
 
+def get_counts_and_probs(seq, target, order, vocab_size, alpha):
+    """
+    Computes the Bayes optimal probability for the specific target token
+    given the sequence history and Dirichlet prior.
+    """
+    # 1. Identify the Context (Query)
+    # The context is the last 'order' tokens of the sequence
+    if order > 0:
+        context = seq[-order:]
+    else:
+        context = torch.tensor([], device=seq.device)
+        
+    # 2. Scan History for Matches
+    # We look at the sequence up to T-1 to see what followed this context previously
+    # Unfold sequence into windows of size (order + 1)
+    # e.g. if seq=[A, B, C, A, B], order=1. Context=B.
+    # Windows: [A, B], [B, C], [C, A], [A, B]
+    # Matches: [A, B] (prev), [A, B] (current). 
+    # We only care about PAST occurrences, so we look at seq[:-1]
+    
+    # We need to count occurrences of (Context -> v) in x_1...x_T
+    # Construct all windows of size order+1 in the sequence x
+    # seq shape: (T,)
+    
+    # If sequence is shorter than order+1, we rely purely on prior
+    if seq.shape[0] < order + 1:
+        # Prior probability
+        return (alpha) / (vocab_size * alpha)
+
+    # Unfold: (num_windows, order+1)
+    windows = seq.unfold(0, order + 1, 1)
+    
+    # The last window in 'windows' is the one ending at T (the query itself).
+    # We want to count occurrences in the history (indices 0 to T-2)
+    # Actually, we are predicting x_{T+1}. The input x includes x_1...x_T.
+    # We want to find times where context x_{T-order+1}...x_T appeared previously.
+    # So we look at windows in x[:-1] that match x[-order:]
+    
+    # Let's simplify:
+    # Query Context: seq[-order:]
+    # Search Space: seq (excluding the implied future)
+    
+    # We want to count N(context -> v) within the observed sequence `seq`
+    # Note: The standard "Induction Head" task is usually: 
+    # "Predict next token based on previous occurrence in THIS context."
+    
+    # Scan windows
+    # windows[:, :-1] are the contexts
+    # windows[:, -1] are the next tokens
+    
+    # We exclude the very last position because that is "now" (we don't know next token yet)
+    # Actually, the 'seq' passed here is x_batch (inputs). 
+    # The 'target' is y_batch (the true next token).
+    # So we scan `seq` entirely.
+    
+    current_context = seq[-order:] if order > 0 else torch.empty(0, device=seq.device)
+    
+    # Find matches
+    if order > 0:
+        # Compare all contexts in the sequence with current_context
+        # windows shape: (num_windows, order+1)
+        # We compare windows[:, :-1] with current_context
+        history_windows = windows # All transitions observed so far
+        
+        # Check equality
+        # (num_windows, order) == (order) -> (num_windows, order)
+        # All must match along dim 1
+        matches = (history_windows[:, :-1] == current_context).all(dim=1)
+        
+        # Get the next tokens for the matches
+        next_tokens = history_windows[matches, -1]
+    else:
+        # Zero order: just count all tokens
+        next_tokens = seq
+        
+    # 3. Compute Dirichlet Posterior Probability
+    # Count occurrences of the specific target
+    count_target = (next_tokens == target).sum().item()
+    total_counts = next_tokens.shape[0]
+    
+    # P = (Count + alpha) / (Total + V*alpha)
+    prob = (count_target + alpha) / (total_counts + vocab_size * alpha)
+    return prob
+
+def compute_optimal_loss(x_batch, y_batch, vocab_size, order, alpha):
+    """
+    Computes the theoretical lower bound loss (Bayes Optimal) for a batch.
+    """
+    nll_sum = 0.0
+    
+    # We iterate because vectorizing variable-length matching is tricky 
+    # and this is only for validation/logging (speed is less critical)
+    for i in range(x_batch.shape[0]):
+        seq = x_batch[i]
+        target = y_batch[i]
+        
+        prob = get_counts_and_probs(seq, target, order, vocab_size, alpha)
+        
+        # Clamp for numerical stability
+        prob = max(prob, 1e-9)
+        nll_sum += -np.log(prob)
+        
+    return nll_sum / x_batch.shape[0]
+
 def evaluate_model(model, x_val, y_val):
     """
     Evaluates the model on a fixed validation set.
@@ -226,6 +330,12 @@ def main():
         args.val_size, args.seq_len, args.vocab_size, args.order_k, args.alpha
     )
 
+# --- COMPUTE OPTIMAL LOSS (BASELINE) ---
+    print("Computing Bayes Optimal Loss for Validation Set...")
+    # This is constant for the fixed validation set
+    optimal_val_loss = compute_optimal_loss(x_val, y_val, args.vocab_size, args.order_k, args.alpha)
+    print(f"Optimal Val Loss (Bayes Limit): {optimal_val_loss:.4f}")
+
     # Training Loop
     for step in range(args.steps):
         # Generate fresh batch
@@ -302,7 +412,11 @@ def main():
                 val_loss = evaluate_model(model, x_val, y_val)
                 print(f"    >>> EVAL: Val Loss = {val_loss:.4f}")
                 print(f"    Param Matrix:\n{model.params.data}")
-                log_dict.update({"val_loss": val_loss})
+                log_dict.update({
+                    "val_loss": val_loss,
+                    "excess_loss": val_loss - optimal_val_loss,
+                    "optimal_loss": optimal_val_loss,
+                })
 
             if not args.no_wandb:
                 wandb.log(log_dict)
