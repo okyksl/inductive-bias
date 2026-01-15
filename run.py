@@ -8,18 +8,19 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 class ConstrainedAttentionModel(nn.Module):
-    def __init__(self, vocab_size, order_k=2, mask_first: bool = False):
+    def __init__(self, vocab_size, init_scale: float = 0.0, order_k=2, mask_first: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.k = order_k
         self.mask_first = mask_first
         
         # Interaction Matrix C of shape (k, k)
-        # C[i, j] weighs the match between:
-        #   Query lag i (0 = current, 1 = previous...)
-        #   Key lag j   (0 = current, 1 = previous...)
-        # Initialize to zeros for sparsity experiments
-        self.params = nn.Parameter(torch.zeros(order_k, order_k))
+        if init_scale > 0.0:
+            # Initialize with small Gaussian noise scaled by init_scale
+            self.params = nn.Parameter(torch.randn(order_k, order_k) * init_scale)
+        else:
+            # Initialize to exact zeros (Uniform attention behavior at start)
+            self.params = nn.Parameter(torch.zeros(order_k, order_k))
 
     def get_windows(self, x):
         """
@@ -170,6 +171,7 @@ def main():
     parser.add_argument("--order_k", type=int, default=1, help="Order of the history window (k)")
     parser.add_argument("--mask_first", action="store_true", help="Whether to mask the first token in attention")
     parser.add_argument("--alpha", type=float, default=1.0, help="Dirichlet concentration parameter")
+    parser.add_argument("--init_scale", type=float, default=0.0, help="Initialization scale")
 
     # Training Params
     parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
@@ -200,7 +202,7 @@ def main():
         )
 
     # Setup
-    model = ConstrainedAttentionModel(args.vocab_size, order_k=args.order_k + 1, mask_first=args.mask_first)
+    model = ConstrainedAttentionModel(args.vocab_size, init_scale=args.init_scale, order_k=args.order_k + 1, mask_first=args.mask_first)
     if args.train_sub_pattern:
             print(f"Configuration: Training ONLY induction diagonals. All else 0.")
             
