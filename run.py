@@ -243,7 +243,7 @@ def main():
         optimizer.step()
         
         # Logging
-        if step % args.log_interval == 0:
+        if step % args.log_interval == 0 or step % args.eval_interval == 0:
             # --- 1. Prepare Data ---
             matrix_data = model.params.detach().cpu().numpy()
             matrix_rounded = np.around(matrix_data, 3)
@@ -297,7 +297,13 @@ def main():
                 induction_vals.append(f"{model.params[i, i+1].item():.2f}")
                 
             print(f"Step {step}: Loss = {loss.item():.4f} | Induction Diags: {induction_vals}")
-            
+
+            if step % args.eval_interval == 0:
+                val_loss = evaluate_model(model, x_val, y_val)
+                print(f"    >>> EVAL: Val Loss = {val_loss:.4f}")
+                print(f"    Param Matrix:\n{model.params.data}")
+                log_dict.update({"val_loss": val_loss})
+
             if not args.no_wandb:
                 wandb.log(log_dict)
 
