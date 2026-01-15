@@ -1,109 +1,148 @@
+import argparse
+import wandb
+import numpy as np
+import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import argparse
-import wandb
-
 class ConstrainedAttentionModel(nn.Module):
-    def __init__(self, vocab_size, mask_first: bool = False):
+    def __init__(self, vocab_size, order_k=2, mask_first: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
+        self.k = order_k
         self.mask_first = mask_first
         
-        # The 4 parameters determining the scale of the identities
-        # Initialized with small random noise
-        self.params = nn.Parameter(torch.zeros(4))
+        # Interaction Matrix C of shape (k, k)
+        # C[i, j] weighs the match between:
+        #   Query lag i (0 = current, 1 = previous...)
+        #   Key lag j   (0 = current, 1 = previous...)
+        # Initialize to zeros for sparsity experiments
+        self.params = nn.Parameter(torch.zeros(order_k, order_k))
 
-    def forward(self, x):
+    def get_windows(self, x):
         """
-        x: (Batch, T) - Sequence of token indices
+        Creates a sliding window representation of the sequence.
+        Output: (Batch, T, k, V)
+            [:, t, 0, :] = x_t
+            [:, t, 1, :] = x_{t-1}
+            ...
         """
         B, T = x.shape
+        emb = F.one_hot(x, num_classes=self.vocab_size).float() # (B, T, V)
         
-        # 1. Embeddings (One-Hot)
-        # Shape: (B, T, V)
-        emb = F.one_hot(x, num_classes=self.vocab_size).float()
+        # Pad the sequence with k-1 zeros at the beginning to handle history for early tokens
+        # Padding shape: (B, k-1, V)
+        padding = torch.zeros(B, self.k - 1, self.vocab_size, device=x.device)
+        padded_emb = torch.cat([padding, emb], dim=1) # (B, T + k - 1, V)
         
-        # 2. Layer 1: Copying [x_t, x_{t-1}]
-        # Create context pairs
-        x_curr = emb
-        x_prev = torch.cat([torch.zeros(B, 1, self.vocab_size, device=x.device), emb[:, :-1, :]], dim=1)
+        # Unfold to create windows
+        # Dimension 1 is time. Size is k. Step is 1.
+        # This creates (B, T, V, k) -> we permute to (B, T, k, V)
+        # Note: Unfold behavior: (B, T_out, V, k)
+        windows = padded_emb.unfold(dimension=1, size=self.k, step=1)
+        windows = windows.permute(0, 1, 3, 2)
         
-        # 3. Layer 2: Attention Mechanism
-        # Query: Last position (T)
-        q_curr = x_curr[:, -1:, :] # x_T
-        q_prev = x_prev[:, -1:, :] # x_{T-1}
+        # Reverse the k dimension so index 0 is Current (x_t) and index k-1 is Oldest
+        # Unfold naturally gives [x_{t-k+1}, ..., x_t]. We want [x_t, ..., x_{t-k+1}]
+        windows = windows.flip(dims=[2])
         
-        # Remove the first index (no attention to first) if requested
-        if self.mask_first:
-            x_curr_k = x_curr[:, 1:, :]
-            x_prev_k = x_prev[:, 1:, :]
-        else:
-            x_curr_k = x_curr
-            x_prev_k = x_prev
+        return windows
 
-        # Keys: All positions
-        k_curr = x_curr_k
-        k_prev = x_prev_k
+    def forward(self, x):
+        B, T = x.shape
         
-        # Calculate Scores (Batch, 1, T)
-        # Note: If mask_first is True, T changes for keys. 
-        # But q stays (B, 1, V). Transpose ensures correct dim match.
-        score_1 = torch.matmul(q_curr, k_curr.transpose(1, 2)) # x_T . x_t
-        score_2 = torch.matmul(q_curr, k_prev.transpose(1, 2)) # x_T . x_{t-1} (Induction)
-        score_3 = torch.matmul(q_prev, k_curr.transpose(1, 2)) # x_{T-1} . x_t
-        score_4 = torch.matmul(q_prev, k_prev.transpose(1, 2)) # x_{T-1} . x_{t-1}
+        # 1. Create Windows: (B, T, k, V)
+        windows = self.get_windows(x)
         
-        # Linear combination of identity matrices
-        scores = (self.params[0] * score_1 + 
-                  self.params[1] * score_2 + 
-                  self.params[2] * score_3 + 
-                  self.params[3] * score_4)
+        # 2. Define Query and Key
+        # Query: The window at the very last position T. Shape (B, k, V)
+        q_window = windows[:, -1, :, :] 
         
-        # Causal Masking (Mask out the query position T to force looking at history)
-        # If we masked first, the sequence length of keys is T-1 or similar, 
-        # we need to be careful with indices. 
-        # For simplicity in this specific script context where we predict last token:
-        # We just want to ensure we don't attend to the *very last* token itself which is the query.
+        # Key: The windows at all positions. Shape (B, T, k, V)
+        k_windows = windows
         
+        if self.mask_first:
+            k_windows = k_windows[:, self.k-1:, :, :]
+
+        # 3. Calculate Scores using Einsum
+        # Equation: Score[b, t] = Sum_{i,j} ( Q[b, i, v] * K[b, t, j, v] * Params[i, j] )
+        # b: batch
+        # t: time (keys)
+        # i: lag index for Query
+        # j: lag index for Key
+        # v: vocab dimension
+        
+        # First, calculate dot products between all lag pairs: (B, T, k_q, k_k)
+        # Contract over 'v'
+        match_matrix = torch.einsum('b i v, b t j v -> b t i j', q_window, k_windows)
+        
+        # Second, weight these matches by the parameter matrix C: (k, k)
+        # Contract over 'i' and 'j'
+        scores = torch.einsum('b t i j, i j -> b t', match_matrix, self.params)
+        
+        # 4. Causal Masking (Mask out the query position itself)
         mask = torch.ones_like(scores)
-        # Mask the last position (which corresponds to the query token itself)
-        mask[:, :, -1] = 0 
+        mask[:, -1] = 0 
         scores = scores.masked_fill(mask == 0, -1e9)
 
-        # 4. Attention Weights (Normalized counts)
-        attn_weights = F.softmax(scores, dim=-1) # (B, 1, T)
+        # 5. Attention Probabilities
+        attn_weights = F.softmax(scores, dim=-1) # (B, T)
         
-        # 5. Value Aggregation
-        values = x_curr_k
-        # (B, 1, T) x (B, T, V) -> (B, V)
-        output = torch.matmul(attn_weights, values).squeeze(1)
+        # 6. Value Aggregation
+        # Value is usually just the token at x_t (lag 0 of the key window)
+        values = k_windows[:, :, 0, :] # (B, T, V)
         
-        # Return raw probabilities directly
+        # (B, T) x (B, T, V) -> (B, V)
+        output = torch.matmul(attn_weights.unsqueeze(1), values).squeeze(1)
+        
         return output
 
-def generate_dirichlet_markov_data(batch_size, seq_len, vocab_size, alpha):
+def generate_dirichlet_markov_data(batch_size, seq_len, vocab_size, order, alpha):
     """
-    Generates sequences where transition probabilities are sampled from Dirichlet(alpha).
+    Generates sequences from an Order-K Markov Chain.
+    P(x_t | x_{t-1}, ..., x_{t-k})
     """
+    # 1. Create Transition Tensor
+    # Shape: (V, V, ..., V) with order+1 dimensions.
+    # The indices [x_{t-k}, ..., x_{t-1}] point to the prob dist for x_t.
+    shape = [vocab_size] * (order + 1)
+    num_states = vocab_size ** order
+    
+    # Flatten to sample Dirichlet, then reshape
+    flat_transitions = torch.distributions.Dirichlet(torch.full((vocab_size,), alpha)).sample((num_states,))
+    transitions = flat_transitions.view(*shape)
+    
     data = []
     targets = []
     
     for _ in range(batch_size):
-        # 1. Sample transition matrix from Dirichlet prior
-        transitions = torch.distributions.Dirichlet(torch.full((vocab_size,), alpha)).sample((vocab_size,))
+        # Initialize with 'order' random tokens
+        seq = [torch.randint(0, vocab_size, (1,)).item() for _ in range(order)]
         
-        # 2. Generate Sequence
-        seq = [torch.randint(0, vocab_size, (1,)).item()]
-        for _ in range(seq_len):
-            curr = seq[-1]
-            probs = transitions[curr]
+        # Generate sequence
+        # We generate enough tokens to fill seq_len + 1 target
+        gen_len = seq_len if seq_len > order else order + 1
+        
+        for _ in range(gen_len):
+            # Get history tuple: last 'order' tokens
+            # transitions[t1, t2, ...] returns probs
+            history = tuple(seq[-order:]) if order > 0 else ()
+            probs = transitions[history]
+            
             next_token = torch.multinomial(probs, 1).item()
             seq.append(next_token)
             
-        data.append(torch.tensor(seq[:-1])) # x_1 ... x_T
-        targets.append(torch.tensor(seq[-1])) # x_{T+1}
+        # Slice to return fixed length inputs
+        # We take the last seq_len tokens as input x
+        full_seq_tensor = torch.tensor(seq)
+        
+        x = full_seq_tensor[-(seq_len+1):-1]
+        y = full_seq_tensor[-1]
+        
+        data.append(x)
+        targets.append(y)
         
     return torch.stack(data), torch.stack(targets)
 
@@ -128,18 +167,19 @@ def main():
     # Model & Data Params
     parser.add_argument("--vocab_size", type=int, default=5, help="Size of vocabulary")
     parser.add_argument("--seq_len", type=int, default=50, help="Length of context sequence")
-    parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
-    parser.add_argument("--val_size", type=int, default=5000, help="Fixed validation set size")
-    parser.add_argument("--alpha", type=float, default=1.0, help="Dirichlet concentration parameter")
+    parser.add_argument("--order_k", type=int, default=1, help="Order of the history window (k)")
     parser.add_argument("--mask_first", action="store_true", help="Whether to mask the first token in attention")
-    
+    parser.add_argument("--alpha", type=float, default=1.0, help="Dirichlet concentration parameter")
+
     # Training Params
+    parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--steps", type=int, default=50000, help="Number of training steps")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--train_sub_pattern", action="store_true", help="Only train sub pattern, keep others at 0")
     parser.add_argument("--log_interval", type=int, default=50, help="Steps between printing training loss")
     parser.add_argument("--eval_interval", type=int, default=500, help="Steps between running validation")
+    parser.add_argument("--val_size", type=int, default=5000, help="Fixed validation set size")
 
     # WandB Params
     parser.add_argument("--wandb_project", type=str, default="induction-head-markov", help="WandB Project Name")
@@ -160,15 +200,20 @@ def main():
         )
 
     # Setup
-    model = ConstrainedAttentionModel(args.vocab_size, mask_first=args.mask_first)
+    model = ConstrainedAttentionModel(args.vocab_size, order_k=args.order_k + 1, mask_first=args.mask_first)
     if args.train_sub_pattern:
-        print("Configuration: Training ONLY c2. c1, c3, c4 will remain 0.0.")
-        # Create a mask where only index 1 (c2) is 1.0, others are 0.0
-        mask = torch.tensor([0., 1., 0., 0.])
-        
-        # Register a hook that multiplies the gradient by this mask
-        # This happens right after loss.backward() and before optimizer.step()
-        model.params.register_hook(lambda grad: grad * mask.to(grad.device))
+            print(f"Configuration: Training ONLY induction diagonals. All else 0.")
+            
+            # Create mask of shape (model_k, model_k)
+            mask = torch.zeros(args.order_k + 1, args.order_k + 1)
+            
+            # Activate the induction diagonal: Query Lag i matches Key Lag i+1
+            # Example: Q0 matches K1 (Bigram), Q1 matches K2 (Trigram), etc.
+            for i in range(args.order_k):
+                mask[i, i+1] = 1.0
+                
+            print(f"Gradient Mask:\n{mask}")
+            model.params.register_hook(lambda grad: grad * mask.to(grad.device))
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     print(f"Initial Params: {model.params.data}")
@@ -176,14 +221,14 @@ def main():
     # --- Generate Fixed Validation Set ---
     print(f"Generating fixed validation set (size {args.val_size})...")
     x_val, y_val = generate_dirichlet_markov_data(
-        args.val_size, args.seq_len, args.vocab_size, args.alpha
+        args.val_size, args.seq_len, args.vocab_size, args.order_k, args.alpha
     )
 
     # Training Loop
     for step in range(args.steps):
         # Generate fresh batch
         x_batch, y_batch = generate_dirichlet_markov_data(
-            args.batch_size, args.seq_len, args.vocab_size, args.alpha
+            args.batch_size, args.seq_len, args.vocab_size, args.order_k, args.alpha
         )
         
         optimizer.zero_grad()
@@ -195,27 +240,64 @@ def main():
         loss.backward()
         optimizer.step()
         
-        c1, c2, c3, c4 = model.params.tolist()
-        log_dict = {}
-
-        # 1. Frequent Logging (Training Loss)
+        # Logging
         if step % args.log_interval == 0:
-            print(f"Step {step}: Train Loss = {loss.item():.4f} | c2={c2:.4f}")
-            log_dict.update({
-                "train_loss": loss.item(),
-                "c1": c1, "c2": c2, "c3": c3, "c4": c4,
-                "step": step
-            })
+            # --- 1. Prepare Data ---
+            matrix_data = model.params.detach().cpu().numpy()
+            matrix_rounded = np.around(matrix_data, 3)
+            
+            # --- 2. Create Plot using Matplotlib ---
+            # This is robust and works on all WandB versions
+            fig, ax = plt.subplots(figsize=(5, 5))
+            cax = ax.matshow(matrix_rounded, cmap='viridis')
+            
+            # Add text (values) inside the squares
+            for i in range(args.order_k + 1):
+                for j in range(args.order_k + 1):
+                    ax.text(j, i, str(matrix_rounded[i, j]), 
+                            ha="center", va="center", color="white", fontsize=8)
+            
+            # Labels
+            labels = [f"L{i}" for i in range(args.order_k + 1)]
+            ax.set_xticks(np.arange(len(labels)))
+            ax.set_yticks(np.arange(len(labels)))
+            ax.set_xticklabels(labels)
+            ax.set_yticklabels(labels)
+            
+            # Label Axes (Recall: Rows=Query, Cols=Key)
+            plt.xlabel("Key Lag")
+            plt.ylabel("Query Lag")
+            plt.title(f"Parameter Matrix (Step {step})")
+            
+            # --- 3. Log to WandB ---
+            log_dict = {
+                "train_loss": loss.item(), 
+                "step": step,
+                "parameter_matrix": wandb.Image(fig)
+            }
 
-        # 2. Infrequent Evaluation (Validation Loss)
-        if step % args.eval_interval == 0:
-            val_loss = evaluate_model(model, x_val, y_val)
-            print(f"    >>> EVAL: Val Loss = {val_loss:.4f}")
-            log_dict.update({"val_loss": val_loss})
+            # Close plot to prevent memory leaks
+            plt.close(fig)
 
-        # Send to WandB if we have anything to log
-        if log_dict and not args.no_wandb:
-            wandb.log(log_dict)
+            # --- LOG FULL MATRIX ---
+            # Iterates through every cell in the k x k matrix
+            # C[i, j] = Weight for Query Lag i interacting with Key Lag j
+            for i in range(args.order_k + 1):
+                for j in range(args.order_k + 1):
+                    val = model.params[i, j].item()
+                    # Key format: "C_q{row}_k{col}"
+                    log_dict[f"param/C_q{i}_k{j}"] = val
+
+            # Print a quick summary to the console (just the induction diagonal)
+            # We assume the "Induction Head" logic lies on the +1 diagonal (j = i + 1)
+            induction_vals = []
+            for i in range(args.order_k):
+                induction_vals.append(f"{model.params[i, i+1].item():.2f}")
+                
+            print(f"Step {step}: Loss = {loss.item():.4f} | Induction Diags: {induction_vals}")
+            
+            if not args.no_wandb:
+                wandb.log(log_dict)
 
     # Final Result
     print("-" * 30)
