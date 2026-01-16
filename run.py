@@ -16,31 +16,33 @@ class ConstrainedAttentionModel(nn.Module):
         order_k=2,
         mask_first: bool = False,
         init_scale: float = 0.0,
-        couple_sub_pattern: bool = False,
+        couple_diagonals: bool = False,  # Changed argument
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.k = order_k
         self.mask_first = mask_first
-        self.couple_sub_pattern = couple_sub_pattern
+        self.couple_diagonals = couple_diagonals
 
-        # Create the induction diagonal mask (Query i matches Key i+1)
-        # We need this regardless of mode to define "sub_pattern"
-        mask = torch.zeros(order_k, order_k)
-        for i in range(order_k - 1):
-            mask[i, i + 1] = 1.0
-
-        # Register as buffer so it moves to GPU but isn't a parameter
-        self.register_buffer("induction_mask", mask)
-
-        if self.couple_sub_pattern:
+        # Precompute indices for diagonal coupling (Toeplitz structure)
+        # We need this to map the (k, k) matrix to the diagonal parameters
+        if self.couple_diagonals:
+            # Range of offsets: -(k-1) to +(k-1). Total 2k-1 parameters.
+            self.num_diags = 2 * order_k - 1
+            
+            # Create indices matrix: indices[i, j] = j - i + (k - 1)
+            # This maps matrix coordinates to the flat parameter vector index
+            rows = torch.arange(order_k).unsqueeze(1)
+            cols = torch.arange(order_k).unsqueeze(0)
+            self.register_buffer("diag_indices", cols - rows + (order_k - 1))
+            
+            # Initialize parameters for diagonals
             if init_scale > 0.0:
-                self.theta = nn.Parameter(torch.randn(1) * init_scale)
+                self.diag_params = nn.Parameter(torch.randn(self.num_diags) * init_scale)
             else:
-                self.theta = nn.Parameter(torch.zeros(1))
+                self.diag_params = nn.Parameter(torch.zeros(self.num_diags))
         else:
             # === FULL MATRIX MODE ===
-            # Standard (k, k) matrix
             if init_scale > 0.0:
                 self.params = nn.Parameter(torch.randn(order_k, order_k) * init_scale)
             else:
@@ -70,10 +72,11 @@ class ConstrainedAttentionModel(nn.Module):
 
     def get_effective_params(self):
         """Returns the (k, k) matrix C used for attention scores."""
-        if self.couple_sub_pattern:
-            # Broadcast scalar theta across the diagonal mask
-            # Result: Diagonal is theta, everything else is 0
-            return self.theta * self.induction_mask
+        if self.couple_diagonals:
+            # Construct the matrix from the diagonal parameters
+            # self.diag_params is (2k-1,)
+            # self.diag_indices is (k, k)
+            return self.diag_params[self.diag_indices]
         else:
             return self.params
 
@@ -105,7 +108,7 @@ class ConstrainedAttentionModel(nn.Module):
         # Contract over 'v'
         match_matrix = torch.einsum("b i v, b t j v -> b t i j", q_window, k_windows)
 
-        # Second, weight these matches by the parameter matrix C: (k, k)
+        # Retrieve effective C matrix (either full or Toeplitz)
         C = self.get_effective_params()
 
         # Contract over 'i' and 'j'
@@ -120,7 +123,7 @@ class ConstrainedAttentionModel(nn.Module):
         attn_weights = F.softmax(scores, dim=-1)  # (B, T)
 
         # 6. Value Aggregation
-        # Value is usually just the token at x_t (lag 0 of the key window)
+        # Value is just the token at x_t (lag 0 of the key window)
         values = k_windows[:, :, 0, :]  # (B, T, V)
 
         # (B, T) x (B, T, V) -> (B, V)
@@ -259,9 +262,7 @@ def get_counts_and_probs(seq, target, order, vocab_size, alpha):
     count_target = (next_tokens == target).sum().item()
     total_counts = next_tokens.shape[0]
 
-    # P = (Count + alpha) / (Total + V*alpha)
-    prob = (count_target + alpha) / (total_counts + vocab_size * alpha)
-    return prob
+    return (count_target + alpha) / (total_counts + vocab_size * alpha)
 
 
 def compute_optimal_loss(x_batch, y_batch, vocab_size, order, alpha):
@@ -322,16 +323,18 @@ def main():
     parser.add_argument(
         "--init_scale", type=float, default=0.0, help="Initialization scale"
     )
+
+    # Training Params
+    parser.add_argument(
+        "--couple_diagonals", 
+        action="store_true", 
+        help="Force parameters to be shared along diagonals (Toeplitz structure)"
+    )
     parser.add_argument(
         "--train_sub_pattern",
         action="store_true",
-        help="Only train sub pattern, keep others at 0",
+        help="Only train sub pattern (gradient masking), keep others at 0",
     )
-    parser.add_argument(
-        "--couple_sub_pattern", action="store_true", help="Couple sub pattern weights"
-    )
-
-    # Training Params
     parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument(
@@ -392,27 +395,39 @@ def main():
     print(f"Optimal Val Loss (Bayes Limit): {optimal_val_loss:.4f}")
 
     # Setup
+    model_k = args.order_k + 1
     model = ConstrainedAttentionModel(
         args.vocab_size,
         init_scale=args.init_scale,
-        order_k=args.order_k + 1,
+        order_k=model_k,
         mask_first=args.mask_first,
-        couple_sub_pattern=args.couple_sub_pattern,
+        couple_diagonals=args.couple_diagonals, # New argument
     )
 
-    if args.train_sub_pattern and not args.couple_sub_pattern:
-        print(f"Configuration: Training ONLY induction diagonals. All else 0.")
-
-        # Create mask of shape (model_k, model_k)
-        mask = torch.zeros(args.order_k + 1, args.order_k + 1)
-
-        # Activate the induction diagonal: Query Lag i matches Key Lag i+1
-        # Example: Q0 matches K1 (Bigram), Q1 matches K2 (Trigram), etc.
-        for i in range(args.order_k):
-            mask[i, i + 1] = 1.0
-
-        print(f"Gradient Mask:\n{mask}")
-        model.params.register_hook(lambda grad: grad * mask.to(grad.device))
+    # === GRADIENT MASKING LOGIC ===
+    if args.couple_diagonals:
+        print(f"Configuration: Coupled Diagonals Mode (Toeplitz).")
+        if args.train_sub_pattern:
+            print("  -> AND 'train_sub_pattern' active: Masking 1D parameters to train ONLY offset +1.")
+            # Calculate index for offset +1
+            # Center (offset 0) is at index K-1. Offset +1 is at K.
+            target_idx = model_k 
+            
+            mask = torch.zeros_like(model.diag_params)
+            if target_idx < mask.shape[0]:
+                mask[target_idx] = 1.0
+            
+            # Register hook on the 1D parameter vector
+            model.diag_params.register_hook(lambda grad: grad * mask.to(grad.device))
+    else:
+        if args.train_sub_pattern:
+            print(f"Configuration: Matrix Mode. Training ONLY induction diagonals (offset +1).")
+            mask = torch.zeros(model_k, model_k)
+            for i in range(model_k - 1):
+                mask[i, i + 1] = 1.0
+            model.params.register_hook(lambda grad: grad * mask.to(grad.device))
+        else:
+            print(f"Configuration: Full Matrix Mode.")
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
@@ -441,9 +456,8 @@ def main():
             fig, ax = plt.subplots(figsize=(5, 5))
             cax = ax.matshow(matrix_rounded, cmap="viridis")
 
-            # Add text (values) inside the squares
-            for i in range(args.order_k + 1):
-                for j in range(args.order_k + 1):
+            for i in range(model_k):
+                for j in range(model_k):
                     ax.text(
                         j,
                         i,
@@ -454,8 +468,7 @@ def main():
                         fontsize=8,
                     )
 
-            # Labels
-            labels = [f"L{i}" for i in range(args.order_k + 1)]
+            labels = [f"L{i}" for i in range(model_k)]
             ax.set_xticks(np.arange(len(labels)))
             ax.set_yticks(np.arange(len(labels)))
             ax.set_xticklabels(labels)
@@ -476,11 +489,8 @@ def main():
             # Close plot to prevent memory leaks
             plt.close(fig)
 
-            # --- LOG FULL MATRIX ---
-            # Iterates through every cell in the k x k matrix
-            # C[i, j] = Weight for Query Lag i interacting with Key Lag j
-            for i in range(args.order_k + 1):
-                for j in range(args.order_k + 1):
+            for i in range(model_k):
+                for j in range(model_k):
                     val = matrix_data[i, j].item()
                     # Key format: "C_q{row}_k{col}"
                     log_dict[f"param/C_q{i}_k{j}"] = val
@@ -498,7 +508,6 @@ def main():
             if step % args.eval_interval == 0:
                 val_loss = evaluate_model(model, x_val, y_val)
                 print(f"    >>> EVAL: Val Loss = {val_loss:.4f}")
-                print(f"    Param Matrix:\n{matrix_data}")
                 log_dict.update(
                     {
                         "val_loss": val_loss,
@@ -513,7 +522,7 @@ def main():
     # Final Result
     print("-" * 30)
     print("Optimization Complete.")
-    print(f"Final Parameters: {model.params.data}")
+    print(f"Final Parameters:\n{model.get_effective_params().data}")
 
     if not args.no_wandb:
         wandb.finish()
