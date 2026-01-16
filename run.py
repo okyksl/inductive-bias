@@ -29,16 +29,18 @@ class ConstrainedAttentionModel(nn.Module):
         if self.couple_diagonals:
             # Range of offsets: -(k-1) to +(k-1). Total 2k-1 parameters.
             self.num_diags = 2 * order_k - 1
-            
+
             # Create indices matrix: indices[i, j] = j - i + (k - 1)
             # This maps matrix coordinates to the flat parameter vector index
             rows = torch.arange(order_k).unsqueeze(1)
             cols = torch.arange(order_k).unsqueeze(0)
             self.register_buffer("diag_indices", cols - rows + (order_k - 1))
-            
+
             # Initialize parameters for diagonals
             if init_scale > 0.0:
-                self.diag_params = nn.Parameter(torch.randn(self.num_diags) * init_scale)
+                self.diag_params = nn.Parameter(
+                    torch.randn(self.num_diags) * init_scale
+                )
             else:
                 self.diag_params = nn.Parameter(torch.zeros(self.num_diags))
         else:
@@ -299,6 +301,25 @@ def evaluate_model(model, x_val, y_val):
     return loss.item()
 
 
+def approximate_beta(order_k, vocab_size, seq_len, alpha) -> float:
+    return np.log(
+        1
+        + (
+            vocab_size
+            / (
+                (
+                    (
+                        1.0
+                        + (alpha * (vocab_size ** (order_k + 1))) / (seq_len - order_k)
+                    )
+                    ** (1.0 / order_k)
+                )
+                - 1
+            )
+        )
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train Constrained Attention on Markov Chains"
@@ -326,9 +347,9 @@ def main():
 
     # Training Params
     parser.add_argument(
-        "--couple_diagonals", 
-        action="store_true", 
-        help="Force parameters to be shared along diagonals (Toeplitz structure)"
+        "--couple_diagonals",
+        action="store_true",
+        help="Force parameters to be shared along diagonals (Toeplitz structure)",
     )
     parser.add_argument(
         "--train_sub_pattern",
@@ -401,27 +422,31 @@ def main():
         init_scale=args.init_scale,
         order_k=model_k,
         mask_first=args.mask_first,
-        couple_diagonals=args.couple_diagonals, # New argument
+        couple_diagonals=args.couple_diagonals,  # New argument
     )
 
     # === GRADIENT MASKING LOGIC ===
     if args.couple_diagonals:
         print(f"Configuration: Coupled Diagonals Mode (Toeplitz).")
         if args.train_sub_pattern:
-            print("  -> AND 'train_sub_pattern' active: Masking 1D parameters to train ONLY offset +1.")
+            print(
+                "  -> AND 'train_sub_pattern' active: Masking 1D parameters to train ONLY offset +1."
+            )
             # Calculate index for offset +1
             # Center (offset 0) is at index K-1. Offset +1 is at K.
-            target_idx = model_k 
-            
+            target_idx = model_k
+
             mask = torch.zeros_like(model.diag_params)
             if target_idx < mask.shape[0]:
                 mask[target_idx] = 1.0
-            
+
             # Register hook on the 1D parameter vector
             model.diag_params.register_hook(lambda grad: grad * mask.to(grad.device))
     else:
         if args.train_sub_pattern:
-            print(f"Configuration: Matrix Mode. Training ONLY induction diagonals (offset +1).")
+            print(
+                f"Configuration: Matrix Mode. Training ONLY induction diagonals (offset +1)."
+            )
             mask = torch.zeros(model_k, model_k)
             for i in range(model_k - 1):
                 mask[i, i + 1] = 1.0
@@ -430,6 +455,13 @@ def main():
             print(f"Configuration: Full Matrix Mode.")
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    approximated_beta = approximate_beta(
+        args.order_k, args.vocab_size, args.seq_len, args.alpha
+    )
+    print(f"Approximated beta {approximated_beta}")
+    if not args.no_wandb:
+        wandb.run.summary["approximated_beta"] = approximated_beta
 
     # Training Loop
     for step in range(args.steps):
