@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-
+import scipy.special
 
 class ConstrainedAttentionModel(nn.Module):
     def __init__(
@@ -287,6 +287,122 @@ def compute_optimal_loss(x_batch, y_batch, vocab_size, order, alpha):
 
     return nll_sum / x_batch.shape[0]
 
+def estimate_overlap_distribution(
+    data_gen_fn, 
+    batch_size, 
+    seq_len, 
+    vocab_size, 
+    order, 
+    alpha, 
+    max_k, 
+    mask_first=False, 
+    variance_threshold=0.01, 
+    min_samples=100, 
+    max_samples=10000
+):
+    # Effective context length (excluding x_t)
+    effective_k = max_k - 1
+    if effective_k < 1:
+        return {}
+
+    # Precompute Binomial Coefficients C[j, i] = (j choose i)
+    # Shape: (effective_k+1, effective_k+1)
+    binom_coeffs = torch.zeros((effective_k + 1, effective_k + 1), dtype=torch.float32)
+    for j in range(effective_k + 1):
+        for i in range(j + 1):
+            binom_coeffs[j, i] = scipy.special.comb(j, i)
+
+    # Storage for all raw samples (safest for variance calc)
+    # N_stats[j] will store list of counts for exactly j matches
+    # K_stats[i] will store list of counts for derived variable K_i
+    N_samples = {j: [] for j in range(effective_k + 1)}
+    K_samples = {i: [] for i in range(effective_k + 1)}
+    
+    total_samples = 0
+    
+    while total_samples < max_samples:
+        x_batch, _ = data_gen_fn(batch_size, seq_len, vocab_size, order, alpha)
+        B, T = x_batch.shape
+        
+        # --- 1. Get Windows ---
+        if mask_first:
+            if T < max_k: continue 
+            windows = x_batch.unfold(dimension=1, size=max_k, step=1)
+        else:
+            padding = torch.zeros(B, max_k - 1, dtype=x_batch.dtype, device=x_batch.device)
+            x_padded = torch.cat([padding, x_batch], dim=1) 
+            windows = x_padded.unfold(dimension=1, size=max_k, step=1)
+            
+        context_windows = windows[:, :, :-1] # Slice off current token
+        query_ctx = context_windows[:, -1, :] 
+        history_ctx = context_windows[:, :-1, :] 
+        
+        if history_ctx.shape[1] == 0: continue
+
+        # --- 2. Compute N_j (Overlap Counts) ---
+        # Matrix of matches: (B, History)
+        # Sum over token dim to get overlap count for each history window
+        overlaps = (history_ctx == query_ctx.unsqueeze(1)).sum(dim=2) # (B, H)
+        
+        # We need the vector [N_0, N_1, ..., N_k] for EACH sequence in batch
+        # shape: (B, effective_k + 1)
+        # We can use scatter_add or a simple loop since effective_k is small
+        N_counts_batch = torch.zeros((B, effective_k + 1), device=x_batch.device)
+        
+        for j in range(effective_k + 1):
+            # Count how many history windows have overlap == j
+            count_j = (overlaps == j).float().sum(dim=1) # (B,)
+            N_counts_batch[:, j] = count_j
+            
+            # Save for stats
+            N_samples[j].extend(count_j.cpu().tolist())
+
+        # --- 3. Compute K_i (Derived Counts) ---
+        # Formula: K_i = Sum_{j>=i} binom(j, i) * N_j
+        # We can do this via matrix multiplication for the whole batch
+        # N_counts_batch: (B, j)
+        # binom_coeffs: (j, i) -> We want (j, i) where i are cols
+        
+        # We use the precomputed coeffs. Move to device.
+        coeffs = binom_coeffs.to(x_batch.device)
+        
+        # Matmul: (B, j) x (j, i) -> (B, i)
+        # resulting K_values shape: (B, effective_k + 1)
+        # Index 0 will be K_0 (which is Sum N_j = Total History), usually uninteresting but calc anyway
+        K_values_batch = torch.matmul(N_counts_batch, coeffs)
+        
+        for i in range(effective_k + 1):
+            K_samples[i].extend(K_values_batch[:, i].cpu().tolist())
+            
+        total_samples += B
+        
+        # --- 4. Convergence Check ---
+        if total_samples >= min_samples:
+            max_sem = 0.0
+            # Check convergence on K variables (usually the ones we care about)
+            for i in range(effective_k + 1):
+                data = np.array(K_samples[i])
+                if len(data) < 2: continue
+                sem = np.std(data, ddof=1) / np.sqrt(len(data))
+                if sem > max_sem: max_sem = sem
+            
+            if max_sem < variance_threshold:
+                print(f"Converged at {total_samples} samples.")
+                break
+
+    # --- 5. Compile Results ---
+    results = {'N': {}, 'K': {}}
+    
+    for j, data in N_samples.items():
+        arr = np.array(data)
+        results['N'][j] = {'mean': np.mean(arr), 'var': np.var(arr, ddof=1)}
+        
+    for i, data in K_samples.items():
+        arr = np.array(data)
+        results['K'][i] = {'mean': np.mean(arr), 'var': np.var(arr, ddof=1)}
+        
+    return results
+
 
 def evaluate_model(model, x_val, y_val):
     """
@@ -334,6 +450,9 @@ def main():
         "--order_k", type=int, default=1, help="Order of the history window (k)"
     )
     parser.add_argument(
+        "--model_k", type=int, default=0, help="Order of the model"
+    )
+    parser.add_argument(
         "--mask_first",
         action="store_true",
         help="Whether to mask the first token in attention",
@@ -377,6 +496,9 @@ def main():
     parser.add_argument(
         "--val_size", type=int, default=5000, help="Fixed validation set size"
     )
+    parser.add_argument(
+        "--estimate_counts", action="store_true", help="Estimate the counts"
+    )
 
     # WandB Params
     parser.add_argument(
@@ -401,11 +523,51 @@ def main():
             project=args.wandb_project, entity=args.wandb_entity, config=vars(args)
         )
 
+    # Setup
+    if args.model_k == 0:
+        model_k = args.order_k + 1
+    else:
+        model_k = args.model_k
+
     # --- Generate Fixed Validation Set ---
     print(f"Generating fixed validation set (size {args.val_size})...")
     x_val, y_val = generate_dirichlet_markov_data(
         args.val_size, args.seq_len, args.vocab_size, args.order_k, args.alpha
     )
+
+    if args.estimate_counts:
+        print(f"Estimating statistics (mask_first={args.mask_first}, context_len={model_k-1})...")
+        stats = estimate_overlap_distribution(
+            generate_dirichlet_markov_data,
+            args.batch_size,
+            args.seq_len,
+            args.vocab_size,
+            args.order_k,
+            args.alpha,
+            max_k=model_k, # This is the model order (e.g. 2 implies 1 context token)
+            mask_first=args.mask_first,
+            variance_threshold=0.05 # Relaxed threshold as Variance of K can be huge
+        )
+        
+        print("\n=== N_j Statistics (Exact Overlaps) ===")
+        print(f"{'j':<5} | {'Mean':<10} | {'Variance':<10}")
+        print("-" * 30)
+        for j, v in stats['N'].items():
+            print(f"{j:<5} | {v['mean']:<10.4f} | {v['var']:<10.4f}")
+
+        print("\n=== K_i Statistics (Sub-pattern Matches) ===")
+        print(f"{'i':<5} | {'Mean':<10} | {'Variance':<10}")
+        print("-" * 30)
+        for i, v in stats['K'].items():
+            print(f"{i:<5} | {v['mean']:<10.4f} | {v['var']:<10.4f}")
+
+        print("\n=== Random Statistics (Sub-pattern Matches) ===")
+        print(f"{'i':<5} | {'Estimate':<10}")
+        print("-" * 30)
+        for i, v in stats['K'].items():
+            print(f"{i:<5} | {stats['K'][0]['mean'] * ((args.vocab_size) ** -i) * scipy.special.comb(model_k-1, i)}")
+
+        return 0
 
     # --- COMPUTE OPTIMAL LOSS (BASELINE) ---
     print("Computing Bayes Optimal Loss for Validation Set...")
@@ -415,8 +577,6 @@ def main():
     )
     print(f"Optimal Val Loss (Bayes Limit): {optimal_val_loss:.4f}")
 
-    # Setup
-    model_k = args.order_k + 1
     model = ConstrainedAttentionModel(
         args.vocab_size,
         init_scale=args.init_scale,
@@ -530,7 +690,7 @@ def main():
             # Print a quick summary to the console (just the induction diagonal)
             # We assume the "Induction Head" logic lies on the +1 diagonal (j = i + 1)
             induction_vals = []
-            for i in range(args.order_k):
+            for i in range(model_k-1):
                 induction_vals.append(f"{matrix_data[i, i+1].item():.2f}")
 
             print(
